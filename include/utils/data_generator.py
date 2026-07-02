@@ -326,12 +326,17 @@ class RealisticSalesDataGenerator:
                     price_factor = 1.0 / (1.0 + product_info['price'] / 100)  # Higher price, lower volume
                     
                     base_quantity = store_traffic * 0.001 * size_factor * price_factor
-                    
-                    quantity = int(
-                        base_quantity * seasonality_factor * promotion_factor *
-                        np.random.normal(1.0, 0.2)
-                    )
-                    quantity = max(0, quantity)
+
+                    expected_quantity = base_quantity * seasonality_factor * promotion_factor
+                    # Poisson sampling models discrete demand counts correctly: it naturally
+                    # produces zeros for genuinely low-demand day/store/product combos while
+                    # still allowing a sale, with variance proportional to the expected rate.
+                    # (Previously: int(expected * N(1.0, 0.2)) truncated any expected demand
+                    # under ~1.0 to zero every time, since np.random.normal(1.0, 0.2) rarely
+                    # pushes a small fraction like 0.3 above 1.0 - that silently zeroed out
+                    # ~98% of rows regardless of real demand, producing far sparser data than
+                    # intended.)
+                    quantity = np.random.poisson(max(expected_quantity, 0))
                     
                     # Calculate revenue
                     actual_price = product_info['price'] * (1 - discount_percent)

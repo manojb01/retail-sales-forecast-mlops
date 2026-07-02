@@ -16,19 +16,24 @@ from utils.mlflow_utils import MLflowManager
 from data_validation.validators import DataValidator
 
 
+# Task-level defaults only - schedule/start_date/catchup are DAG-level settings and must be
+# passed directly to @dag(), not nested in default_args. They were previously misplaced here,
+# which meant Airflow silently ignored "schedule": "@weekly" (default_args isn't read for
+# that), leaving the DAG on a NullTimetable - i.e. manual-trigger-only, never actually running
+# on the intended weekly cadence.
 default_args = {
     "owner": "data-team",
     "depends_on_past": False,
-    "start_date": datetime(2025, 7, 22),
     "retries": 1,
     "retry_delay": timedelta(minutes=1),
-    "catchup": False,
-    "schedule": "@weekly",
 }
 
 
 @dag(
     default_args=default_args,
+    start_date=datetime(2025, 7, 22),
+    schedule="@weekly",
+    catchup=False,
     description="Train sales forecasting models",
     tags=["ml", "training", "sales"],
 )
@@ -56,10 +61,12 @@ def sales_forecast_training():
     @task()
     def validate_data_task(extract_result):
         import glob
+        from data_validation.validators import DataValidator
 
         file_paths = extract_result["file_paths"]
         total_rows = 0
         issues_found = []
+        sample_dfs = []
         print(f"Validating {len(file_paths['sales'])} sales files...")
         for i, sales_file in enumerate(file_paths["sales"][:10]):
             df = pd.read_parquet(sales_file)
@@ -83,17 +90,63 @@ def sales_forecast_training():
                 issues_found.append(f"Negative quantities in {sales_file}")
             if df["revenue"].min() < 0:
                 issues_found.append(f"Negative revenue in {sales_file}")
+            sample_dfs.append(df)
         for data_type in ["promotions", "store_events", "customer_traffic"]:
             if data_type in file_paths and file_paths[data_type]:
                 sample_file = file_paths[data_type][0]
                 df = pd.read_parquet(sample_file)
                 print(f"{data_type} data shape: {df.shape}")
                 print(f"{data_type} columns: {df.columns.tolist()}")
+
+        # Real data-quality validation (Pandera-backed schema check, null/duplicate/outlier
+        # profiling, time-series gap detection) on the sampled files - not just the ad hoc
+        # checks above
+        validator_report = None
+        drift_report = None
+        if sample_dfs:
+            combined_sample = pd.concat(sample_dfs, ignore_index=True)
+            validator = DataValidator()
+            validator_report = validator.generate_validation_report(combined_sample)
+
+            schema_issues = validator_report["schema_validation"]["errors"]
+            quality_issues = validator_report["data_quality"]["quality_issues"]
+            print(f"DataValidator schema check: {'passed' if validator_report['schema_validation']['is_valid'] else 'FAILED'}")
+            if schema_issues:
+                print(f"  Schema issues: {schema_issues}")
+            if quality_issues:
+                print(f"  Quality issues: {quality_issues}")
+            issues_found.extend(schema_issues)
+            issues_found.extend(quality_issues)
+
+            if "time_series_validation" in validator_report:
+                ts = validator_report["time_series_validation"]
+                if ts.get("gaps"):
+                    n_gap_groups = len(ts["gaps"]) if isinstance(ts["gaps"], list) else 1
+                    print(f"  Time-series gaps detected in {n_gap_groups} store/date group(s)")
+
+            # KS-test drift check against the reference saved by the last run, BEFORE
+            # overwriting that reference with this run's sample
+            drift_report = validator.check_data_drift(combined_sample)
+            if drift_report.get("drifted_features"):
+                print(f"  Data drift detected (KS test) in: {drift_report['drifted_features']}")
+                issues_found.append(f"Data drift detected in: {drift_report['drifted_features']}")
+            elif drift_report.get("reference_available"):
+                print("  No significant data drift detected (KS test)")
+            validator.save_drift_reference(combined_sample)
+
         validation_summary = {
             "total_files_validated": len(file_paths["sales"][:10]),
             "total_rows": total_rows,
             "issues_found": len(issues_found),
             "issues": issues_found[:5],
+            "data_quality_report": {
+                "schema_valid": validator_report["schema_validation"]["is_valid"] if validator_report else None,
+                "quality_issues_count": len(validator_report["data_quality"]["quality_issues"]) if validator_report else None,
+            } if validator_report else None,
+            "drift_report": {
+                "reference_available": drift_report.get("reference_available") if drift_report else None,
+                "drifted_features": drift_report.get("drifted_features") if drift_report else None,
+            } if drift_report else None,
         }
         if issues_found:
             print(f"Validation completed with {len(issues_found)} issues:")

@@ -5,7 +5,6 @@ Model visualization and comparison module for sales forecasting
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
 # Removed plotly imports - using matplotlib only
 from typing import Dict, List, Optional, Any, Tuple
 import logging
@@ -164,7 +163,7 @@ class ModelVisualizer:
         box_data = [residuals for residuals in residuals_data.values()]
         box_colors = [self.colors.get(model.lower(), '#95A5A6') for model in residuals_data.keys()]
         
-        bp = ax1.boxplot(box_data, labels=list(residuals_data.keys()), patch_artist=True)
+        bp = ax1.boxplot(box_data, tick_labels=list(residuals_data.keys()), patch_artist=True)
         for patch, color in zip(bp['boxes'], box_colors):
             patch.set_facecolor(color)
             patch.set_alpha(0.7)

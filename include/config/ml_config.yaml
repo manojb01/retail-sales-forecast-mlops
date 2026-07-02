@@ -36,13 +36,14 @@ models:
 features:
   date_features:
     - day
-    - week
+    - weekofyear
     - month
     - year
     - dayofweek
     - dayofyear
     - quarter
     - is_weekend
+    - is_holiday
   
   lag_features:
     - 1
@@ -58,23 +59,30 @@ features:
     functions: ["mean", "std", "min", "max", "median"]
 
 # Data Validation
+# Schema below matches the raw per-product sales rows validated at the
+# validate_data_task stage (before the DAG's own aggregation renames revenue -> sales)
 validation:
   required_columns:
     - "date"
-    - "sales"
+    - "revenue"
+    - "quantity_sold"
     - "store_id"
     - "product_id"
-  
+
   data_types:
     date: "datetime64[ns]"
-    sales: "float64"
-    store_id: "int64"
-    product_id: "int64"
-  
+    revenue: "float64"
+    quantity_sold: "int64"
+    store_id: "object"
+    product_id: "object"
+
   value_ranges:
-    sales:
+    revenue:
       min: 0
       max: 1000000
+    quantity_sold:
+      min: 0
+      max: 100000
 
 # Training Configuration
 training:

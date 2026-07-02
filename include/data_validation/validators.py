@@ -6,8 +6,12 @@ from pandera import Column, DataFrameSchema, Check
 import yaml
 import logging
 from datetime import datetime
+from pathlib import Path
+from scipy import stats
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_DRIFT_REFERENCE_PATH = "/usr/local/airflow/data/reference/sales_drift_reference.parquet"
 
 
 class DataValidator:
@@ -195,7 +199,70 @@ class DataValidator:
                     )
         
         return len(errors) == 0, errors
-    
+
+    def check_data_drift(self, df: pd.DataFrame, reference_path: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Detect feature distribution drift against a saved reference sample, using the
+        two-sample Kolmogorov-Smirnov test (per monitoring.drift_detection in ml_config.yaml).
+
+        The reference is a sample of raw sales data saved by validate_data_task after each
+        run, so this compares "what we validated last time" against "what's arriving now" -
+        a real, statistically grounded drift check, not just a mean/std threshold. On the
+        first-ever run (no reference saved yet) this is a no-op.
+        """
+        drift_cfg = self.config.get('monitoring', {}).get('drift_detection', {})
+        if not drift_cfg.get('enabled', False):
+            return {'enabled': False}
+
+        ref_path = Path(reference_path or DEFAULT_DRIFT_REFERENCE_PATH)
+        if not ref_path.exists():
+            logger.info(f"No drift reference found at {ref_path} yet - skipping (created after this run)")
+            return {'enabled': True, 'reference_available': False, 'drifted_features': []}
+
+        reference_df = pd.read_parquet(ref_path)
+        threshold = drift_cfg.get('threshold', 0.1)
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+
+        feature_results = {}
+        drifted_features = []
+        for col in numeric_cols:
+            if col in reference_df.columns:
+                current_vals = df[col].dropna()
+                reference_vals = reference_df[col].dropna()
+                if len(current_vals) < 2 or len(reference_vals) < 2:
+                    continue
+
+                statistic, p_value = stats.ks_2samp(reference_vals, current_vals)
+                is_drifted = bool(statistic > threshold)
+                feature_results[col] = {
+                    'ks_statistic': float(statistic),
+                    'p_value': float(p_value),
+                    'drifted': is_drifted
+                }
+                if is_drifted:
+                    drifted_features.append(col)
+
+        if drifted_features:
+            logger.warning(f"Data drift detected (KS test, threshold={threshold}): {drifted_features}")
+        else:
+            logger.info(f"No significant data drift detected (KS test, threshold={threshold})")
+
+        return {
+            'enabled': True,
+            'reference_available': True,
+            'method': 'kolmogorov_smirnov',
+            'threshold': threshold,
+            'feature_results': feature_results,
+            'drifted_features': drifted_features
+        }
+
+    def save_drift_reference(self, df: pd.DataFrame, reference_path: Optional[str] = None) -> None:
+        """Save the current sample as the drift-detection reference for the next run."""
+        ref_path = Path(reference_path or DEFAULT_DRIFT_REFERENCE_PATH)
+        ref_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(ref_path, index=False)
+        logger.info(f"Saved drift-detection reference snapshot ({len(df)} rows) to {ref_path}")
+
     def generate_validation_report(self, df: pd.DataFrame) -> Dict[str, Any]:
         logger.info("Starting data validation")
         

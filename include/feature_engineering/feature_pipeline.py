@@ -110,19 +110,80 @@ class FeatureEngineer:
         logger.info("Created cyclical features")
         return df
     
+    def reindex_to_contiguous_dates(self, df: pd.DataFrame, target_col: str,
+                                   date_col: str = 'date',
+                                   group_cols: Optional[List[str]] = None) -> pd.DataFrame:
+        """
+        Fill in missing calendar dates per group so lag/rolling features computed via
+        shift()/rolling() operate on true calendar-adjacent days, not just the previous
+        *recorded* row. Without this, a sparse series (e.g. a store with sales on only
+        some days) makes 'lag_1' actually mean "whatever the last recorded sale was",
+        which could be many days earlier - silently corrupting the temporal signal.
+
+        The target column is filled with 0 (no sale that day, the correct real-world
+        interpretation), other numeric columns are forward/backward-filled, and
+        categorical columns are forward/backward-filled too.
+        """
+        df = df.copy()
+        df[date_col] = pd.to_datetime(df[date_col])
+
+        # Reindexing assumes exactly one row per (group, date) - if the caller passes data
+        # with multiple rows per group/date (e.g. grouping by store only when rows are at
+        # store+product granularity), "filling gaps" isn't well-defined, so skip rather than
+        # crash or silently collapse rows.
+        dedupe_keys = (group_cols or []) + [date_col]
+        if df.duplicated(subset=dedupe_keys).any():
+            logger.warning(
+                f"Skipping contiguous-date reindexing: duplicate rows found for {dedupe_keys} "
+                f"(this grouping doesn't have exactly one row per group/date)"
+            )
+            return df
+
+        def _reindex_group(g: pd.DataFrame, drop_cols: Optional[List[str]] = None) -> pd.DataFrame:
+            if drop_cols:
+                g = g.drop(columns=drop_cols)
+            full_range = pd.date_range(g[date_col].min(), g[date_col].max(), freq='D')
+            g = g.set_index(date_col).reindex(full_range)
+            g.index.name = date_col
+            g[target_col] = g[target_col].fillna(0)
+            other_cols = [c for c in g.columns if c != target_col]
+            g[other_cols] = g[other_cols].ffill().bfill()
+            return g.reset_index()
+
+        if group_cols:
+            # drop_cols avoids relying on apply(..., include_groups=False), which is only
+            # available in pandas>=2.2 - this codebase runs on 2.1.x
+            filled = (
+                df.groupby(group_cols, group_keys=True)
+                  .apply(lambda g: _reindex_group(g, drop_cols=group_cols))
+                  .reset_index(level=list(range(len(group_cols))))
+                  .reset_index(drop=True)
+            )
+        else:
+            filled = _reindex_group(df)
+
+        added = len(filled) - len(df)
+        logger.info(f"Reindexed to contiguous daily dates per group: {added} gap-fill rows added "
+                    f"({len(df)} -> {len(filled)} rows)")
+        return filled
+
     def create_all_features(self, df: pd.DataFrame, target_col: str = 'sales',
-                           date_col: str = 'date', 
+                           date_col: str = 'date',
                            group_cols: Optional[List[str]] = None,
                            categorical_cols: Optional[List[str]] = None) -> pd.DataFrame:
-        
+
         logger.info("Starting feature engineering pipeline")
-        
+
         # Sort by date for proper lag and rolling calculations
         if group_cols:
             df = df.sort_values(group_cols + [date_col])
         else:
             df = df.sort_values(date_col)
-        
+
+        # Fill calendar gaps per group BEFORE lag/rolling features are computed, so
+        # shift()/rolling() operate on true calendar-adjacent days
+        df = self.reindex_to_contiguous_dates(df, target_col, date_col, group_cols)
+
         # Create date features
         df = self.create_date_features(df, date_col)
         
@@ -158,8 +219,10 @@ class FeatureEngineer:
                     # For time-based features, forward fill then backward fill
                     df[col] = df[col].ffill().bfill()
                 else:
-                    # For other features, use mean
-                    df[col] = df[col].fillna(df[col].mean())
+                    # For other features, use mean - but an all-NaN column has a NaN mean,
+                    # which would leave it unfilled, so fall back to 0 in that case
+                    col_mean = df[col].mean()
+                    df[col] = df[col].fillna(col_mean if pd.notna(col_mean) else 0)
         
         return df
     
@@ -171,7 +234,11 @@ class FeatureEngineer:
         # Prepare data for feature selection
         X = df.drop(columns=[target_col])
         y = df[target_col]
-        
+
+        # Drop datetime columns - RandomForestRegressor can't fit on them directly, and
+        # date info is already captured via create_date_features/create_cyclical_features
+        X = X.drop(columns=X.select_dtypes(include=['datetime64']).columns)
+
         # Encode categorical variables
         label_encoders = {}
         for col in X.select_dtypes(include=['object']).columns:

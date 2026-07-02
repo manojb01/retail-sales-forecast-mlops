@@ -150,10 +150,7 @@ networks:
   # network names below to match your local setup. Find them by running:
   #   docker network ls | grep sales-forecast
   airflow:
-    external: true
-    name: sales-forecast_4eb5e1_airflow
   default:
-    name: sales-forecast_4eb5e1_default
 
 volumes:
   mlflow-db-volume:

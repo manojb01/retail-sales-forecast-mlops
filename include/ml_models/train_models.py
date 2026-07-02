@@ -6,7 +6,7 @@ import joblib
 import logging
 from datetime import datetime
 
-from sklearn.model_selection import train_test_split, cross_val_score, TimeSeriesSplit
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import StandardScaler, OrdinalEncoder
 
@@ -22,8 +22,6 @@ import mlflow
 
 from utils.mlflow_utils import MLflowManager
 from feature_engineering.feature_pipeline import FeatureEngineer
-from data_validation.validators import DataValidator
-from ml_models.advanced_ensemble import AdvancedEnsemble
 from ml_models.ensemble_model import EnsembleModel
 from ml_models.diagnostics import diagnose_model_performance
 
@@ -39,8 +37,7 @@ class ModelTrainer:
         self.training_config = self.config['training']
         self.mlflow_manager = MLflowManager(config_path)
         self.feature_engineer = FeatureEngineer(config_path)
-        self.data_validator = DataValidator(config_path)
-        
+
         self.models = {}
         self.scalers = {}
         self.encoders = {}
@@ -143,14 +140,51 @@ class ModelTrainer:
         
         self.scalers['standard'] = scaler
         self.feature_cols = feature_cols
-        
+
         return X_train_scaled, X_val_scaled, X_test_scaled, y_train, y_val, y_test
-    
+
+    @staticmethod
+    def _no_improvement_callback(patience: int = 15):
+        """Stop an Optuna study once best_value hasn't improved for `patience`
+        consecutive trials, instead of always burning the full trial budget even
+        after the search has clearly converged."""
+        state = {'best_value': None, 'no_improve_count': 0}
+
+        def callback(study, trial):
+            if state['best_value'] is None or study.best_value < state['best_value']:
+                state['best_value'] = study.best_value
+                state['no_improve_count'] = 0
+            else:
+                state['no_improve_count'] += 1
+
+            if state['no_improve_count'] >= patience:
+                logger.info(
+                    f"Stopping study early: no improvement in {patience} consecutive trials "
+                    f"(best={state['best_value']:.4f}, stopped at trial {trial.number})"
+                )
+                study.stop()
+
+        return callback
+
     def calculate_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+        y_true = np.asarray(y_true)
+        y_pred = np.asarray(y_pred)
+
+        # MAPE is mathematically undefined at y_true=0 (division by ~0 blows up to billions of
+        # percent for any nonzero prediction, regardless of how good the model actually is).
+        # Zero-sales days are now a real, legitimate possibility since gap-filling in
+        # reindex_to_contiguous_dates() fills missing dates with 0 sales. Standard practice is
+        # to compute MAPE only over rows with a genuinely nonzero actual value.
+        nonzero_mask = np.abs(y_true) > 1e-6
+        if nonzero_mask.any():
+            mape = np.mean(np.abs((y_true[nonzero_mask] - y_pred[nonzero_mask]) / y_true[nonzero_mask])) * 100
+        else:
+            mape = float('nan')
+
         metrics = {
             'rmse': np.sqrt(mean_squared_error(y_true, y_pred)),
             'mae': mean_absolute_error(y_true, y_pred),
-            'mape': np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), 1e-8))) * 100,
+            'mape': mape,
             'r2': r2_score(y_true, y_pred)
         }
         return metrics
@@ -162,6 +196,9 @@ class ModelTrainer:
         logger.info("Training XGBoost model")
         
         if use_optuna:
+            cv_folds = self.training_config.get('cv_folds', 5)
+            tscv = TimeSeriesSplit(n_splits=cv_folds)
+
             def objective(trial):
                 params = {
                     'n_estimators': trial.suggest_int('n_estimators', 50, 300),
@@ -172,31 +209,47 @@ class ModelTrainer:
                     'gamma': trial.suggest_float('gamma', 0, 0.5),
                     'reg_alpha': trial.suggest_float('reg_alpha', 0, 1.0),
                     'reg_lambda': trial.suggest_float('reg_lambda', 0, 1.0),
-                    'random_state': 42
+                    'random_state': 42,
+                    'early_stopping_rounds': 50,
                 }
-                
-                params['early_stopping_rounds'] = 50
-                model = xgb.XGBRegressor(**params)
-                model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
-                
-                y_pred = model.predict(X_val)
-                return np.sqrt(mean_squared_error(y_val, y_pred))
-            
+
+                # Rolling-origin time-series CV: each fold trains on an earlier chronological
+                # slice and validates on the slice immediately after it, never on the future.
+                # A plain KFold would shuffle time order and leak future rows into training -
+                # not valid for a forecasting problem.
+                fold_rmses = []
+                for fold_idx, (train_idx, cv_val_idx) in enumerate(tscv.split(X_train)):
+                    X_cv_train, X_cv_val = X_train.iloc[train_idx], X_train.iloc[cv_val_idx]
+                    y_cv_train, y_cv_val = y_train[train_idx], y_train[cv_val_idx]
+
+                    model = xgb.XGBRegressor(**params)
+                    model.fit(X_cv_train, y_cv_train, eval_set=[(X_cv_val, y_cv_val)], verbose=False)
+                    y_pred = model.predict(X_cv_val)
+                    fold_rmses.append(np.sqrt(mean_squared_error(y_cv_val, y_pred)))
+
+                    # Report the running mean after each fold so MedianPruner can compare
+                    # this trial's trajectory against prior trials at the same fold and kill
+                    # clearly-bad hyperparameter combinations before running all cv_folds
+                    trial.report(float(np.mean(fold_rmses)), step=fold_idx)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned()
+
+                return float(np.mean(fold_rmses))
+
             study = optuna.create_study(
                 direction='minimize',
                 sampler=optuna.samplers.TPESampler(seed=42),
                 pruner=optuna.pruners.MedianPruner()
             )
-            study.optimize(objective, n_trials=self.config['training'].get('optuna_trials', 50))
-            
+            study.optimize(
+                objective,
+                n_trials=self.config['training'].get('optuna_trials', 50),
+                callbacks=[self._no_improvement_callback(patience=15)]
+            )
+
+            logger.info(f"Best XGBoost CV RMSE ({cv_folds}-fold TimeSeriesSplit): {study.best_value:.4f} "
+                        f"({len(study.trials)} trials run)")
             best_params = study.best_params
-            # logger.info(f"Best XGBoost parameters: {best_params}")
-
-            # model = xgb.XGBRegressor(**best_params)
-            # model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
-
-            # self.models['xgboost'] = model
-            # return model
             best_params['random_state'] = 42
         else:
             best_params = self.model_config['xgboost']['params']
@@ -215,6 +268,9 @@ class ModelTrainer:
         logger.info("Training LightGBM model")
         
         if use_optuna:
+            cv_folds = self.training_config.get('cv_folds', 5)
+            tscv = TimeSeriesSplit(n_splits=cv_folds)
+
             def objective(trial):
                 params = {
                     'num_leaves': trial.suggest_int('num_leaves', 20, 100),
@@ -231,21 +287,39 @@ class ModelTrainer:
                     'metric': 'rmse',
                     'boosting_type': 'gbdt'
                 }
-                
-                model = lgb.LGBMRegressor(**params)
-                model.fit(X_train, y_train, eval_set=[(X_val, y_val)], 
-                         callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
-                
-                y_pred = model.predict(X_val)
-                return np.sqrt(mean_squared_error(y_val, y_pred))
-            
+
+                # Rolling-origin time-series CV - see XGBoost objective above for rationale
+                fold_rmses = []
+                for fold_idx, (train_idx, cv_val_idx) in enumerate(tscv.split(X_train)):
+                    X_cv_train, X_cv_val = X_train.iloc[train_idx], X_train.iloc[cv_val_idx]
+                    y_cv_train, y_cv_val = y_train[train_idx], y_train[cv_val_idx]
+
+                    model = lgb.LGBMRegressor(**params)
+                    model.fit(X_cv_train, y_cv_train, eval_set=[(X_cv_val, y_cv_val)],
+                             callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
+                    y_pred = model.predict(X_cv_val)
+                    fold_rmses.append(np.sqrt(mean_squared_error(y_cv_val, y_pred)))
+
+                    # See XGBoost objective above - lets MedianPruner kill bad trials early
+                    trial.report(float(np.mean(fold_rmses)), step=fold_idx)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned()
+
+                return float(np.mean(fold_rmses))
+
             study = optuna.create_study(
                 direction='minimize',
                 sampler=optuna.samplers.TPESampler(seed=42),
                 pruner=optuna.pruners.MedianPruner()
             )
-            study.optimize(objective, n_trials=self.config['training'].get('optuna_trials', 50))
-            
+            study.optimize(
+                objective,
+                n_trials=self.config['training'].get('optuna_trials', 50),
+                callbacks=[self._no_improvement_callback(patience=15)]
+            )
+
+            logger.info(f"Best LightGBM CV RMSE ({cv_folds}-fold TimeSeriesSplit): {study.best_value:.4f} "
+                        f"({len(study.trials)} trials run)")
             best_params = study.best_params
             best_params['random_state'] = 42
             best_params['verbosity'] = -1
